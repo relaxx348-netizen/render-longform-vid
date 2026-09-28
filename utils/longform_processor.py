@@ -9,6 +9,21 @@ import httpx
 
 MAX_LONGFORM_DURATION_SECONDS = 7200  # 2 hours
 DOWNLOAD_TIMEOUT = 300  # 5 min per file
+IMAGE_FPS = 5  # still images do not need 30 fps; keeps memory and CPU low
+
+# Limit encoder resources so ffmpeg is not killed (signal 9) in small containers
+LOW_MEMORY_ENCODE_ARGS = [
+    "-threads", "2",
+    "-filter_complex_threads", "1",
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-x264-params", "rc-lookahead=10:sliced-threads=0",
+    "-crf", "23",
+    "-pix_fmt", "yuv420p",
+    "-c:a", "aac",
+    "-b:a", "128k",
+    "-movflags", "+faststart",
+]
 
 
 def _clean_ffmpeg_error(result, max_len: int = 4000) -> str:
@@ -101,7 +116,7 @@ def create_video_from_images(
 ) -> float:
     """
     Create a video from images and audio.
-    Images are looped/cycled to match audio duration.
+    Images are cycled to match audio duration.
     Fixed aspect ratio: 16:9
     Resolution: 720p or 1080p
     Returns final video duration (capped at 2 hours).
@@ -115,32 +130,38 @@ def create_video_from_images(
     filter_parts = []
 
     for i, img_path in enumerate(image_paths):
-        inputs.extend(["-loop", "1", "-t", str(duration_per_image), "-i", str(img_path)])
+        inputs.extend([
+            "-framerate", str(IMAGE_FPS),
+            "-loop", "1",
+            "-t", str(duration_per_image),
+            "-i", str(img_path),
+        ])
         filter_parts.append(
             f"[{i}:v]scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v{i}]"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={IMAGE_FPS}[v{i}]"
         )
 
     inputs.extend(["-i", str(audio_path)])
     audio_idx = num_images
 
-    filter_parts.append(
-        "".join([f"[v{i}]" for i in range(num_images)]) +
-        f"concat=n={num_images}:v=1:a=0[v]"
-    )
+    if num_images == 1:
+        filter_parts.append("[v0]null[v]")
+    else:
+        filter_parts.append(
+            "".join([f"[v{i}]" for i in range(num_images)]) +
+            f"concat=n={num_images}:v=1:a=0[v]"
+        )
     filter_complex = ";".join(filter_parts)
 
     cmd = [
         "ffmpeg", "-y",
+        "-nostats",
         *inputs,
         "-filter_complex", filter_complex,
         "-map", "[v]",
         "-map", f"{audio_idx}:a",
-        "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "23",
-        "-c:a", "aac",
-        "-b:a", "128k",
+        *LOW_MEMORY_ENCODE_ARGS,
+        "-tune", "stillimage",
         "-t", str(final_duration),
         "-shortest",
         str(output_path),
@@ -197,6 +218,7 @@ def create_video_from_videos(
     # Loop the file with -stream_loop (re-reads from disk, no in-memory buffering)
     cmd = [
         "ffmpeg", "-y",
+        "-nostats",
         "-stream_loop", "-1",
         "-i", str(bg_input),
         "-i", str(audio_path),
@@ -205,11 +227,7 @@ def create_video_from_videos(
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30",
         "-map", "0:v",
         "-map", "1:a",
-        "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "23",
-        "-c:a", "aac",
-        "-b:a", "128k",
+        *LOW_MEMORY_ENCODE_ARGS,
         "-t", str(final_duration),
         "-shortest",
         str(output_path),
